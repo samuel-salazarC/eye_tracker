@@ -2,8 +2,6 @@
 
 A Python-based eye tracking tool that captures gaze data via webcam using [MediaPipe Face Mesh](https://google.github.io/mediapipe/solutions/face_mesh) and generates heatmaps to visualize eye movement across the screen.
 
-![Heatmap Example](docs/example_heatmap.png)
-
 ## 🔍 Features
 
 - Real-time webcam eye tracking

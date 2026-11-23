@@ -1,71 +1,125 @@
-import cv2
-import mediapipe as mp
+"""Record iris positions from a webcam with MediaPipe Face Landmarker and save them to CSV."""
+
+import argparse
 import csv
 import time
+import urllib.request
+from pathlib import Path
 
-# Initialize MediaPipe Face Mesh with refine_landmarks=True for iris points
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(
-    static_image_mode=False,
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
+import cv2
+import mediapipe as mp
+from mediapipe.tasks.python import BaseOptions, vision
+
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/latest/face_landmarker.task"
 )
+DEFAULT_MODEL_PATH = Path("models/face_landmarker.task")
 
-# Start webcam capture
-cap = cv2.VideoCapture(0)
+# Centre of each iris in the 478-point face landmark model
+LEFT_IRIS = 468
+RIGHT_IRIS = 473
 
-# Open CSV file to save data
-csv_file = open('generated_mockup_data.csv', mode='w', newline='')
-csv_writer = csv.writer(csv_file)
-csv_writer.writerow(['x', 'y', 'time'])
+CSV_COLUMNS = ["time", "x", "y", "left_x", "left_y", "right_x", "right_y"]
 
-# Indices for left and right iris landmarks
-LEFT_IRIS_LANDMARK = 468
-RIGHT_IRIS_LANDMARK = 473
 
-print("Press 'q' to stop recording...")
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-o", "--output", default="gaze_data.csv",
+                        help="CSV file for the recorded positions (default: gaze_data.csv)")
+    parser.add_argument("--camera", type=int, default=0,
+                        help="Index of the webcam to use (default: 0)")
+    parser.add_argument("--duration", type=float, default=None,
+                        help="Stop automatically after this many seconds")
+    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_PATH,
+                        help=f"Path to the Face Landmarker model (default: {DEFAULT_MODEL_PATH})")
+    return parser.parse_args()
 
-start_time = time.time()
 
-while cap.isOpened():
-    success, frame = cap.read()
-    if not success:
-        print("Failed to capture frame.")
-        break
+def ensure_model(path: Path) -> Path:
+    """Download the Face Landmarker model the first time the tracker runs."""
+    if path.exists():
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading the Face Landmarker model to {path}...")
+    urllib.request.urlretrieve(MODEL_URL, path)
+    return path
 
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = face_mesh.process(frame_rgb)
 
-    if results.multi_face_landmarks:
-        for face_landmarks in results.multi_face_landmarks:
-            height, width, _ = frame.shape
-            landmarks = face_landmarks.landmark
+def iris_positions(landmarks, width: int, height: int):
+    """Return the pixel positions of both irises and of their midpoint.
 
-            # Check if landmarks include iris points
-            if len(landmarks) > RIGHT_IRIS_LANDMARK:
-                left_iris = landmarks[LEFT_IRIS_LANDMARK]
-                right_iris = landmarks[RIGHT_IRIS_LANDMARK]
+    ``landmarks`` is the list of normalized landmarks of one face. Returns ``None`` if
+    the list does not include the iris points.
+    """
+    if len(landmarks) <= RIGHT_IRIS:
+        return None
+    left = (round(landmarks[LEFT_IRIS].x * width), round(landmarks[LEFT_IRIS].y * height))
+    right = (round(landmarks[RIGHT_IRIS].x * width), round(landmarks[RIGHT_IRIS].y * height))
+    centre = (round((left[0] + right[0]) / 2), round((left[1] + right[1]) / 2))
+    return {"left": left, "right": right, "centre": centre}
 
-                left_x, left_y = int(left_iris.x * width), int(left_iris.y * height)
-                right_x, right_y = int(right_iris.x * width), int(right_iris.y * height)
 
-                elapsed_time = round(time.time() - start_time, 2)
+def main():
+    args = parse_args()
+    model_path = ensure_model(args.model)
 
-                # Save positions and time to CSV
-                csv_writer.writerow([left_x, left_y, elapsed_time])
-                csv_writer.writerow([right_x, right_y, elapsed_time])
+    options = vision.FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=str(model_path)),
+        running_mode=vision.RunningMode.VIDEO,
+        num_faces=1,
+    )
 
-                # Draw circles on screen at iris positions
-                cv2.circle(frame, (left_x, left_y), 3, (255, 0, 0), -1)   # Blue circle for left iris
-                cv2.circle(frame, (right_x, right_y), 3, (0, 255, 0), -1) # Green circle for right iris
+    camera = cv2.VideoCapture(args.camera)
+    if not camera.isOpened():
+        raise SystemExit(f"Could not open camera {args.camera}.")
 
-    cv2.imshow('Eye Tracker', frame)
+    samples = 0
+    start = time.monotonic()
+    last_timestamp_ms = -1
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+    with vision.FaceLandmarker.create_from_options(options) as landmarker, \
+            open(args.output, "w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(CSV_COLUMNS)
+        print("Recording. Press 'q' in the video window to stop.")
 
-cap.release()
-csv_file.close()
-cv2.destroyAllWindows()
+        while True:
+            success, frame = camera.read()
+            if not success:
+                print("Could not read a frame from the camera.")
+                break
+
+            elapsed = time.monotonic() - start
+            if args.duration is not None and elapsed >= args.duration:
+                break
+
+            # The video mode requires strictly increasing timestamps
+            timestamp_ms = max(int(elapsed * 1000), last_timestamp_ms + 1)
+            last_timestamp_ms = timestamp_ms
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = landmarker.detect_for_video(image, timestamp_ms)
+
+            if result.face_landmarks:
+                height, width = frame.shape[:2]
+                points = iris_positions(result.face_landmarks[0], width, height)
+                if points:
+                    writer.writerow([round(elapsed, 3), *points["centre"],
+                                     *points["left"], *points["right"]])
+                    samples += 1
+                    cv2.circle(frame, points["left"], 3, (255, 0, 0), -1)
+                    cv2.circle(frame, points["right"], 3, (0, 255, 0), -1)
+
+            cv2.imshow("Eye Tracker", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+    camera.release()
+    cv2.destroyAllWindows()
+    print(f"Saved {samples} samples to {args.output}.")
+
+
+if __name__ == "__main__":
+    main()
